@@ -1,0 +1,66 @@
+import numpy as np
+from numba import njit
+
+
+@njit
+def calculate_rmax_topt(vegetation, spei):
+    """
+    Calculate Rmax and Topt for one pixel.
+
+    vegetation: (n_months, n_years)
+    spei:       (n_scales, n_months, n_years)
+    """
+    n_months, n_years = vegetation.shape
+    n_scales = spei.shape[0]
+
+    rmax = -1.0
+    topt = -1
+
+    for month in range(n_months):
+        for scale in range(n_scales):
+
+            x = vegetation[month]
+            y = spei[scale, month]
+
+            x_sum = 0.0
+            y_sum = 0.0
+            n = 0
+
+            for year in range(n_years):
+                if not np.isnan(x[year]) and not np.isnan(y[year]):
+                    x_sum += x[year]
+                    y_sum += y[year]
+                    n += 1
+
+            if n < 10:
+                continue
+
+            x_mean = x_sum / n
+            y_mean = y_sum / n
+
+            numerator = 0.0
+            x_variance = 0.0
+            y_variance = 0.0
+
+            for year in range(n_years):
+                if not np.isnan(x[year]) and not np.isnan(y[year]):
+                    dx = x[year] - x_mean
+                    dy = y[year] - y_mean
+
+                    numerator += dx * dy
+                    x_variance += dx * dx
+                    y_variance += dy * dy
+
+            denominator = np.sqrt(x_variance * y_variance)
+
+            if denominator > 0:
+                correlation = numerator / denominator
+
+                if correlation > 0 and correlation > rmax:
+                    rmax = correlation
+                    topt = scale + 1
+
+    if topt == -1:
+        return np.nan, np.nan
+
+    return rmax, topt
