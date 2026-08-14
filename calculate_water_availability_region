@@ -1,0 +1,70 @@
+import numpy as np
+from scipy.stats import pearsonr
+
+
+def calculate_water_region(vegetation, spei):
+    """
+    Classify one pixel as water-deficit, water-surplus, or unclassified.
+
+    Parameters
+    ----------
+    vegetation : ndarray
+        Shape: (n_months, n_years).
+
+    spei : ndarray
+        Shape: (n_scales, n_months, n_years).
+
+    Returns
+    -------
+    region_type : int
+        1  = water-deficit-dominated region
+       -1  = water-surplus-dominated region
+        0  = neutral/unclassified region
+
+    n_positive : int
+        Number of significant positive vegetation-SPEI correlations.
+
+    n_negative : int
+        Number of significant negative vegetation-SPEI correlations.
+    """
+    n_months = vegetation.shape[0]
+    n_scales = spei.shape[0]
+
+    n_positive = 0
+    n_negative = 0
+
+    for month in range(n_months):
+        vegetation_series = vegetation[month]
+
+        for scale in range(n_scales):
+            spei_series = spei[scale, month]
+
+            valid = (
+                ~np.isnan(vegetation_series)
+                & ~np.isnan(spei_series)
+            )
+
+            if valid.sum() < 10:
+                continue
+
+            r, p = pearsonr(
+                vegetation_series[valid],
+                spei_series[valid]
+            )
+
+            if p < 0.05:
+                if r > 0:
+                    n_positive += 1
+                elif r < 0:
+                    n_negative += 1
+
+    if n_positive > n_negative:
+        region_type = 1       # water-deficit-dominated
+    elif n_negative > n_positive:
+        region_type = -1      # water-surplus-dominated
+    else:
+        region_type = 0       # neutral/unclassified
+                              # includes equal positive/negative counts
+                              # and no significant correlations
+
+    return region_type, n_positive, n_negative
