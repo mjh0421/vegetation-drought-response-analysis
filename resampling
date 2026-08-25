@@ -1,0 +1,86 @@
+import os
+import numpy as np
+import rasterio
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+
+# ============================================================
+# User settings
+# ============================================================
+input_folder = "input_folder"
+output_folder = "output_folder"
+
+target_crs = "EPSG:4326"
+target_resolution = 0.1
+output_dtype = "float32"
+
+# Select the resampling method according to data type and purpose:
+# Resampling.nearest  -> categorical variables (e.g., land cover)
+# Resampling.bilinear -> continuous variables for interpolation
+# Resampling.average  -> continuous variables when aggregating
+#                        from a finer to a coarser spatial resolution
+RESAMPLING_METHOD = Resampling.average
+
+os.makedirs(output_folder, exist_ok=True)
+
+# ============================================================
+# Batch reprojection and resampling
+# ============================================================
+for filename in os.listdir(input_folder):
+
+    if not filename.lower().endswith(".tif"):
+        continue
+
+    input_path = os.path.join(input_folder, filename)
+    output_path = os.path.join(output_folder, filename)
+
+    with rasterio.open(input_path) as src:
+
+        # Calculate output transform and raster dimensions
+        transform, width, height = calculate_default_transform(
+            src.crs,
+            target_crs,
+            src.width,
+            src.height,
+            *src.bounds,
+            resolution=target_resolution
+        )
+
+        # Update output metadata
+        meta = src.meta.copy()
+        meta.update({
+            "crs": target_crs,
+            "transform": transform,
+            "width": width,
+            "height": height,
+            "dtype": output_dtype,
+            "nodata": np.nan,
+            "compress": "lzw"
+        })
+
+        # Initialize output raster
+        destination = np.full(
+            (height, width),
+            np.nan,
+            dtype=np.float32
+        )
+
+        # Reproject and resample
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=destination,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=transform,
+            dst_crs=target_crs,
+            src_nodata=src.nodata,
+            dst_nodata=np.nan,
+            resampling=RESAMPLING_METHOD
+        )
+
+        # Write output raster
+        with rasterio.open(output_path, "w", **meta) as dst:
+            dst.write(destination.astype(output_dtype), 1)
+
+    print(f"Completed: {filename}")
+
+print("All files have been processed.")
