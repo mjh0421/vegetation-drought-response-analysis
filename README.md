@@ -1,1 +1,1 @@
-Python code for calculating vegetation drought-response intensity (Rmax), optimal drought accumulation timescale (Topt), and water-deficit and water-surplus masks.
+Python code for data resampling, calculation of vegetation drought-response intensity (Rmax) and optimal drought accumulation timescale (Topt), identification of water-deficit and water-surplus regions, trend analysis, XGBoost-SHAP analysis
