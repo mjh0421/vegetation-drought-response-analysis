@@ -1,0 +1,173 @@
+import os
+import numpy as np
+import rasterio
+import pymannkendall as mk
+from tqdm import tqdm
+
+# ============================================================
+# User settings
+# ============================================================
+input_folder = "input_folder"
+output_folder = "output_folder"
+
+VARIABLE_PREFIX = "Topt_observed_significant"
+VARIABLE_NAME = "Topt"
+
+WINDOW_LENGTH = 17
+START_YEAR = 1983
+LAST_START_YEAR = 2006
+
+ALPHA = 0.05
+MIN_VALID = 13
+
+os.makedirs(output_folder, exist_ok=True)
+
+
+# ============================================================
+# Read raster and convert NoData to NaN
+# ============================================================
+def read_tif(path):
+    with rasterio.open(path) as src:
+        return src.read(1, masked=True).filled(np.nan).astype(np.float32)
+
+
+# ============================================================
+# Pixel-wise Theil-Sen slope + Hamed-Rao modified MK test
+# ============================================================
+def trend_analysis(data_stack):
+    _, nrows, ncols = data_stack.shape
+
+    slope_array = np.full(
+        (nrows, ncols),
+        np.nan,
+        dtype=np.float32
+    )
+
+    pvalue_array = np.full(
+        (nrows, ncols),
+        np.nan,
+        dtype=np.float32
+    )
+
+    for i in tqdm(range(nrows), desc="Trend analysis"):
+        for j in range(ncols):
+
+            y = data_stack[:, i, j]
+            y = y[np.isfinite(y)]
+
+            if y.size < MIN_VALID:
+                continue
+
+            result = mk.hamed_rao_modification_test(
+                y,
+                alpha=ALPHA
+            )
+
+            slope_array[i, j] = result.slope
+            pvalue_array[i, j] = result.p
+
+    return slope_array, pvalue_array
+
+
+# ============================================================
+# Save raster
+# ============================================================
+def save_tif(path, data, profile):
+    nodata = -9999.0
+
+    output_profile = profile.copy()
+    output_profile.update(
+        driver="GTiff",
+        dtype="float32",
+        count=1,
+        nodata=nodata,
+        compress="lzw"
+    )
+
+    output_data = np.where(
+        np.isfinite(data),
+        data,
+        nodata
+    ).astype(np.float32)
+
+    with rasterio.open(path, "w", **output_profile) as dst:
+        dst.write(output_data, 1)
+
+
+# ============================================================
+# Main workflow
+# ============================================================
+if __name__ == "__main__":
+
+    # Generate moving-window raster list
+    tif_list = [
+        os.path.join(
+            input_folder,
+            f"{VARIABLE_PREFIX}_{year}_"
+            f"{year + WINDOW_LENGTH - 1}.tif"
+        )
+        for year in range(
+            START_YEAR,
+            LAST_START_YEAR + 1
+        )
+    ]
+
+    # Check input files
+    missing_files = [
+        path for path in tif_list
+        if not os.path.exists(path)
+    ]
+
+    if missing_files:
+        raise FileNotFoundError(
+            f"{len(missing_files)} input raster(s) are missing."
+        )
+
+    print(f"Number of moving windows: {len(tif_list)}")
+
+    # Read raster metadata
+    with rasterio.open(tif_list[0]) as src:
+        profile = src.profile.copy()
+        height = src.height
+        width = src.width
+
+    # Load moving-window rasters
+    data_stack = np.full(
+        (len(tif_list), height, width),
+        np.nan,
+        dtype=np.float32
+    )
+
+    for i, path in enumerate(
+        tqdm(tif_list, desc="Reading rasters")
+    ):
+        data_stack[i] = read_tif(path)
+
+    # Trend analysis
+    sen_slope, modified_mk_p = trend_analysis(
+        data_stack
+    )
+
+    # Save Theil-Sen slope
+    save_tif(
+        os.path.join(
+            output_folder,
+            f"{VARIABLE_NAME}_SenSlope_"
+            f"{WINDOW_LENGTH}yr.tif"
+        ),
+        sen_slope,
+        profile
+    )
+
+    # Save Hamed-Rao modified MK p-value
+    save_tif(
+        os.path.join(
+            output_folder,
+            f"{VARIABLE_NAME}_HamedRaoMK_Pvalue_"
+            f"{WINDOW_LENGTH}yr.tif"
+        ),
+        modified_mk_p,
+        profile
+    )
+
+    print("Trend analysis completed.")
