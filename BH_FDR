@@ -1,0 +1,148 @@
+import numpy as np
+from scipy.stats import t as student_t
+
+
+def pearson_r(x, y):
+    valid = np.isfinite(x) & np.isfinite(y)
+
+    if valid.sum() < 15:
+        return np.nan, valid.sum()
+
+    x = x[valid]
+    y = y[valid]
+
+    if np.std(x) == 0 or np.std(y) == 0:
+        return np.nan, valid.sum()
+
+    return np.corrcoef(x, y)[0, 1], valid.sum()
+
+
+def one_sided_p(r, n):
+    if not np.isfinite(r) or r <= 0:
+        return 1.0
+
+    r = min(r, 1 - 1e-15)
+
+    t = r * np.sqrt(
+        (n - 2) / (1 - r ** 2)
+    )
+
+    return student_t.sf(
+        t,
+        n - 2
+    )
+
+
+def bh_fdr(p_values):
+    p_values = np.asarray(
+        p_values,
+        dtype=float
+    )
+
+    order = np.argsort(p_values)
+    p_sorted = p_values[order]
+
+    m = len(p_sorted)
+
+    q_sorted = (
+        p_sorted
+        * m
+        / np.arange(1, m + 1)
+    )
+
+    q_sorted = np.minimum.accumulate(
+        q_sorted[::-1]
+    )[::-1]
+
+    q_sorted = np.clip(
+        q_sorted,
+        0,
+        1
+    )
+
+    q_values = np.empty_like(q_sorted)
+    q_values[order] = q_sorted
+
+    return q_values
+
+
+def rmax_topt_fdr(
+    vegetation,
+    spei
+):
+    """
+    vegetation: shape (7, 17)
+                April-October vegetation series
+
+    spei: shape (24, 7, 17)
+          SPEI scales 1-24 for April-October
+
+    Returns
+    -------
+    Rmax, Topt, best_month
+    """
+
+    scales = np.arange(1, 25)
+    months = np.arange(4, 11)
+
+    records = []
+
+    # 7 months × 24 SPEI scales = 168 candidate correlations
+    for m in range(7):
+        for s in range(24):
+
+            r, n = pearson_r(
+                vegetation[m],
+                spei[s, m]
+            )
+
+            if np.isfinite(r):
+                p = one_sided_p(r, n)
+
+                records.append(
+                    [r, p, m, s]
+                )
+
+    if len(records) == 0:
+        return np.nan, np.nan, np.nan
+
+    records = np.asarray(records)
+
+    r_values = records[:, 0]
+    p_values = records[:, 1]
+
+    # BH-FDR correction across all valid candidate tests
+    # within each pixel
+    q_values = bh_fdr(
+        p_values
+    )
+
+    significant = (
+        (r_values > 0)
+        & (q_values < 0.05)
+    )
+
+    if not np.any(significant):
+        return np.nan, np.nan, np.nan
+
+    idx = np.where(
+        significant
+    )[0]
+
+    best = idx[
+        np.argmax(
+            r_values[idx]
+        )
+    ]
+
+    Rmax = r_values[best]
+
+    Topt = scales[
+        int(records[best, 3])
+    ]
+
+    best_month = months[
+        int(records[best, 2])
+    ]
+
+    return Rmax, Topt, best_month
