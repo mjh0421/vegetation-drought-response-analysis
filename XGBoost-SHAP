@@ -1,98 +1,288 @@
-import os
 import numpy as np
 import rasterio
 import shap
+
 from xgboost import XGBRegressor
 from skopt import BayesSearchCV
 from sklearn.model_selection import GroupKFold
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from sklearn.metrics import (
+    r2_score,
+    mean_squared_error,
+    mean_absolute_error
+)
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+TARGET = "Rmax"      # "Rmax" or "Topt"
 
 target_file = "target.tif"
-driver_files = ["driver1.tif", "driver2.tif", "driver3.tif"]
+driver_files = [
+    "driver1.tif",
+    "driver2.tif",
+    "driver3.tif"
+]
 
-BLOCK_SIZE = 10
-N_SPLITS = 5
+BLOCK_SIZE = 10       # 10 × 10 pixels ≈ 1° × 1°
+OUTER_FOLDS = 5
+INNER_FOLDS = 4
 N_BAYES_ITER = 50
 RANDOM_STATE = 42
 
-def read_raster(path):
-    with rasterio.open(path) as src:
-        return src.read(1, masked=True).filled(np.nan).astype(np.float32)
 
-y_grid = read_raster(target_file)
-X_stack = np.stack([read_raster(f) for f in driver_files], axis=-1)
+# ============================================================
+# ACTUAL HYPERPARAMETER SEARCH RANGES
+# ============================================================
 
-mask = np.isfinite(y_grid) & np.all(np.isfinite(X_stack), axis=-1)
-X, y = X_stack[mask], y_grid[mask]
-
-rows, cols = np.where(mask)
-n_block_cols = int(np.ceil(mask.shape[1] / BLOCK_SIZE))
-groups = (rows // BLOCK_SIZE) * n_block_cols + (cols // BLOCK_SIZE)
-
-cv = GroupKFold(n_splits=N_SPLITS)
-
-model = XGBRegressor(
-    objective="reg:squarederror",
-    random_state=RANDOM_STATE,
-    tree_method="hist"
-)
-
-# Define hyperparameter ranges according to the analysis
-param_space = {
-    "n_estimators": (...),
-    "max_depth": (...),
-    "learning_rate": (...),
-    "subsample": (...),
-    "colsample_bytree": (...),
-    "min_child_weight": (...),
-    "gamma": (...),
-    "reg_alpha": (...),
-    "reg_lambda": (...)
+RMAX_PARAM_SPACE = {
+    "n_estimators": (250, 350),
+    "max_depth": (3, 4),
+    "learning_rate": (0.02, 0.06),
+    "subsample": (0.7, 0.8),
+    "colsample_bytree": (0.7, 0.8),
+    "min_child_weight": (12, 25),
+    "gamma": (0, 2),
+    "reg_alpha": (1.0, 5.0),
+    "reg_lambda": (2.0, 6.0)
 }
 
+TOPT_PARAM_SPACE = {
+    "n_estimators": (200, 300),
+    "max_depth": (3, 4),
+    "learning_rate": (0.05, 0.07),
+    "subsample": (0.65, 0.75),
+    "colsample_bytree": (0.7, 0.8),
+    "min_child_weight": (25, 40),
+    "gamma": (0, 2),
+    "reg_alpha": (0.5, 5.0),
+    "reg_lambda": (8.0, 20.0)
+}
+
+param_space = (
+    RMAX_PARAM_SPACE
+    if TARGET == "Rmax"
+    else TOPT_PARAM_SPACE
+)
+
+
+# ============================================================
+# DATA
+# ============================================================
+
+def read_raster(path):
+    with rasterio.open(path) as src:
+        x = src.read(1, masked=True).filled(np.nan)
+    return x.astype(np.float32)
+
+
+y_grid = read_raster(target_file)
+
+X_stack = np.stack(
+    [read_raster(f) for f in driver_files],
+    axis=-1
+)
+
+mask = (
+    np.isfinite(y_grid)
+    & np.all(np.isfinite(X_stack), axis=-1)
+)
+
+X = X_stack[mask]
+y = y_grid[mask]
+
+
+# ============================================================
+# 1° SPATIAL BLOCKS
+# ============================================================
+
+rows, cols = np.where(mask)
+
+n_block_cols = int(
+    np.ceil(mask.shape[1] / BLOCK_SIZE)
+)
+
+groups = (
+    (rows // BLOCK_SIZE) * n_block_cols
+    + (cols // BLOCK_SIZE)
+)
+
+
+def make_model(seed):
+    return XGBRegressor(
+        objective="reg:squarederror",
+        random_state=seed,
+        tree_method="hist",
+        n_jobs=-1
+    )
+
+
+# ============================================================
+# NESTED SPATIAL CROSS-VALIDATION
+# ============================================================
+
+outer_cv = GroupKFold(
+    n_splits=OUTER_FOLDS
+)
+
+all_obs = []
+all_pred = []
+
+for fold, (train_idx, test_idx) in enumerate(
+    outer_cv.split(X, y, groups),
+    start=1
+):
+
+    X_train = X[train_idx]
+    y_train = y[train_idx]
+    g_train = groups[train_idx]
+
+    X_test = X[test_idx]
+    y_test = y[test_idx]
+
+    # Inner spatial CV for Bayesian hyperparameter tuning
+    inner_cv = GroupKFold(
+        n_splits=INNER_FOLDS
+    )
+
+    optimizer = BayesSearchCV(
+        estimator=make_model(
+            RANDOM_STATE + fold
+        ),
+        search_spaces=param_space,
+        n_iter=N_BAYES_ITER,
+        cv=inner_cv,
+        scoring="r2",
+        random_state=RANDOM_STATE + fold,
+        n_jobs=-1
+    )
+
+    optimizer.fit(
+        X_train,
+        y_train,
+        groups=g_train
+    )
+
+    # Outer test set is untouched during tuning
+    model = make_model(
+        RANDOM_STATE + 1000 + fold
+    )
+
+    model.set_params(
+        **optimizer.best_params_
+    )
+
+    model.fit(
+        X_train,
+        y_train
+    )
+
+    pred = model.predict(
+        X_test
+    )
+
+    all_obs.append(y_test)
+    all_pred.append(pred)
+
+
+# ============================================================
+# INDEPENDENT OUTER-TEST PERFORMANCE
+# ============================================================
+
+all_obs = np.concatenate(all_obs)
+all_pred = np.concatenate(all_pred)
+
+pooled_r2 = r2_score(
+    all_obs,
+    all_pred
+)
+
+pooled_rmse = np.sqrt(
+    mean_squared_error(
+        all_obs,
+        all_pred
+    )
+)
+
+pooled_mae = mean_absolute_error(
+    all_obs,
+    all_pred
+)
+
+print("Pooled outer-test R2:", pooled_r2)
+print("Pooled outer-test RMSE:", pooled_rmse)
+print("Pooled outer-test MAE:", pooled_mae)
+
+
+# ============================================================
+# FINAL EXPLANATORY MODEL FOR SHAP
+# ============================================================
+# Spatial Bayesian tuning using all valid pixels.
+# This model is used for explanatory SHAP analysis,
+# not for independent performance assessment.
+
+spatial_cv = GroupKFold(
+    n_splits=5
+)
+
 optimizer = BayesSearchCV(
-    model,
-    param_space,
+    estimator=make_model(
+        RANDOM_STATE
+    ),
+    search_spaces=param_space,
     n_iter=N_BAYES_ITER,
-    cv=cv,
+    cv=spatial_cv,
     scoring="r2",
     random_state=RANDOM_STATE,
     n_jobs=-1
 )
 
-optimizer.fit(X, y, groups=groups)
+optimizer.fit(
+    X,
+    y,
+    groups=groups
+)
+
 best_params = optimizer.best_params_
 
-r2, rmse, mae = [], [], []
+print("Final SHAP-model parameters:")
+print(best_params)
 
-for train, test in cv.split(X, y, groups):
-    model = XGBRegressor(
-        objective="reg:squarederror",
-        random_state=RANDOM_STATE,
-        tree_method="hist",
-        **best_params
-    )
-    model.fit(X[train], y[train])
-    pred = model.predict(X[test])
+final_model = make_model(
+    RANDOM_STATE
+)
 
-    r2.append(r2_score(y[test], pred))
-    rmse.append(np.sqrt(mean_squared_error(y[test], pred)))
-    mae.append(mean_absolute_error(y[test], pred))
-
-print("R2:", np.mean(r2))
-print("RMSE:", np.mean(rmse))
-print("MAE:", np.mean(mae))
-
-final_model = XGBRegressor(
-    objective="reg:squarederror",
-    random_state=RANDOM_STATE,
-    tree_method="hist",
+final_model.set_params(
     **best_params
 )
-final_model.fit(X, y)
 
-shap_values = shap.TreeExplainer(final_model).shap_values(X)
-importance = np.mean(np.abs(shap_values), axis=0)
+final_model.fit(
+    X,
+    y
+)
 
-for f, v in sorted(zip(driver_files, importance), key=lambda x: x[1], reverse=True):
-    print(f, v)
+
+# ============================================================
+# SHAP IMPORTANCE
+# ============================================================
+
+explainer = shap.TreeExplainer(
+    final_model
+)
+
+shap_values = explainer.shap_values(
+    X
+)
+
+importance = np.mean(
+    np.abs(shap_values),
+    axis=0
+)
+
+for feature, value in sorted(
+    zip(driver_files, importance),
+    key=lambda x: x[1],
+    reverse=True
+):
+    print(feature, value)
