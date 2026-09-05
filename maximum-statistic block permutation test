@@ -1,0 +1,122 @@
+import numpy as np
+
+
+def block_permutations(
+    n_years=17,
+    block_length=2,
+    n_perm=199,
+    seed=20260714
+):
+    rng = np.random.default_rng(seed)
+
+    blocks = [
+        np.arange(i, min(i + block_length, n_years))
+        for i in range(0, n_years, block_length)
+    ]
+
+    perms = []
+
+    while len(perms) < n_perm:
+        order = rng.permutation(len(blocks))
+        idx = np.concatenate([blocks[i] for i in order])
+
+        if not np.array_equal(idx, np.arange(n_years)):
+            perms.append(idx)
+
+    return np.asarray(perms)
+
+
+def pearson_r(x, y):
+    valid = np.isfinite(x) & np.isfinite(y)
+
+    # Complete 17-year observations required
+    if valid.sum() < 17:
+        return np.nan
+
+    x = x[valid]
+    y = y[valid]
+
+    if np.std(x) == 0 or np.std(y) == 0:
+        return np.nan
+
+    return np.corrcoef(x, y)[0, 1]
+
+
+def maxstat_rmax_topt(
+    vegetation,
+    spei
+):
+    """
+    vegetation: shape (7, 17)
+    spei:       shape (24, 7, 17)
+    """
+
+    scales = np.arange(1, 25)
+    months = np.arange(4, 11)
+
+    # --------------------------------------------------------
+    # Observed Rmax and Topt
+    # --------------------------------------------------------
+    observed_rmax = -np.inf
+    observed_topt = np.nan
+    best_month = np.nan
+
+    for m in range(7):
+        for s in range(24):
+
+            r = pearson_r(
+                vegetation[m],
+                spei[s, m]
+            )
+
+            if np.isfinite(r) and r > 0 and r > observed_rmax:
+                observed_rmax = r
+                observed_topt = scales[s]
+                best_month = months[m]
+
+    if not np.isfinite(observed_rmax):
+        return np.nan, np.nan, np.nan, np.nan
+
+    # --------------------------------------------------------
+    # Maximum-statistic block permutation
+    # --------------------------------------------------------
+    permutations = block_permutations()
+
+    null_maxima = []
+
+    for idx in permutations:
+
+        perm_max = -np.inf
+
+        # Same year-block permutation for all growing-season months
+        veg_perm = vegetation[:, idx]
+
+        for m in range(7):
+            for s in range(24):
+
+                r = pearson_r(
+                    veg_perm[m],
+                    spei[s, m]
+                )
+
+                if np.isfinite(r) and r > perm_max:
+                    perm_max = r
+
+        if np.isfinite(perm_max):
+            null_maxima.append(perm_max)
+
+    null_maxima = np.asarray(null_maxima)
+
+    # Empirical max-statistic p value
+    p_value = (
+        1 + np.sum(null_maxima >= observed_rmax)
+    ) / (
+        1 + len(null_maxima)
+    )
+
+    return (
+        observed_rmax,
+        observed_topt,
+        best_month,
+        p_value
+    )
