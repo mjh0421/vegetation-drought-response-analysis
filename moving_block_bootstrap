@@ -1,0 +1,251 @@
+import math
+import numpy as np
+
+
+# ============================================================
+# 1. Moving-block bootstrap indices
+# ============================================================
+
+def mbb_indices(n_years, block_length=2, n_boot=999, seed=20260714):
+    """
+    Generate moving-block bootstrap indices for the full temporal sequence.
+    """
+    rng = np.random.default_rng(seed)
+    starts = np.arange(n_years - block_length + 1)
+
+    out = np.empty((n_boot, n_years), dtype=np.int32)
+
+    for b in range(n_boot):
+        sampled_starts = rng.choice(
+            starts,
+            math.ceil(n_years / block_length),
+            replace=True
+        )
+
+        idx = np.concatenate([
+            np.arange(s, s + block_length)
+            for s in sampled_starts
+        ])
+
+        out[b] = idx[:n_years]
+
+    return out
+
+
+# ============================================================
+# 2. Linear trend + residual decomposition
+# ============================================================
+
+def fit_trend_and_residual(y):
+    """
+    Decompose a time series into a fitted linear temporal component
+    and residuals.
+    """
+    y = np.asarray(y, dtype=float)
+    t = np.arange(len(y))
+
+    valid = np.isfinite(y)
+
+    if valid.sum() < 2:
+        return (
+            np.full_like(y, np.nan),
+            np.full_like(y, np.nan)
+        )
+
+    slope, intercept = np.polyfit(t[valid], y[valid], 1)
+
+    fitted = intercept + slope * t
+
+    residual = np.full_like(y, np.nan)
+    residual[valid] = y[valid] - fitted[valid]
+
+    return fitted, residual
+
+
+# ============================================================
+# 3. Pearson correlation
+# ============================================================
+
+def pearson_r(x, y, min_n=17):
+    valid = np.isfinite(x) & np.isfinite(y)
+
+    if valid.sum() < min_n:
+        return np.nan
+
+    if np.std(x[valid]) == 0 or np.std(y[valid]) == 0:
+        return np.nan
+
+    return np.corrcoef(x[valid], y[valid])[0, 1]
+
+
+# ============================================================
+# 4. Calculate Topt for one moving window
+# ============================================================
+
+def calculate_topt(veg, spei, scales, start, window=17):
+    """
+    Parameters
+    ----------
+    veg : array, shape (month, year)
+    spei : array, shape (scale, month, year)
+    scales : SPEI timescales, e.g. 1-24
+    """
+
+    best_r = -np.inf
+    best_scale = np.nan
+
+    for m in range(veg.shape[0]):
+        for s in range(spei.shape[0]):
+
+            x = veg[m, start:start + window]
+            y = spei[s, m, start:start + window]
+
+            r = pearson_r(x, y, min_n=window)
+
+            # Rmax/Topt are defined using the strongest
+            # positive vegetation-SPEI correlation.
+            if np.isfinite(r) and r > 0 and r > best_r:
+                best_r = r
+                best_scale = scales[s]
+
+    return best_scale
+
+
+# ============================================================
+# 5. Theil-Sen slope
+# ============================================================
+
+def theil_sen_slope(y):
+    y = np.asarray(y, dtype=float)
+
+    if np.any(~np.isfinite(y)):
+        return np.nan
+
+    slopes = []
+
+    for i in range(len(y) - 1):
+        for j in range(i + 1, len(y)):
+            slopes.append((y[j] - y[i]) / (j - i))
+
+    return np.median(slopes)
+
+
+# ============================================================
+# 6. Trend-preserving residual moving-block bootstrap
+# ============================================================
+
+def bootstrap_topt_trend(
+    veg,
+    spei,
+    scales=np.arange(1, 25),
+    window=17,
+    block_length=2,
+    n_boot=999,
+    seed=20260714
+):
+    """
+    Trend-preserving residual moving-block bootstrap for Topt trend.
+
+    veg:
+        shape = (month, year)
+
+    spei:
+        shape = (scale, month, year)
+
+    The fitted temporal component is retained at its original
+    temporal position. Only residuals are resampled in moving
+    blocks. The same full-series bootstrap realization is then
+    used to reconstruct all overlapping moving windows.
+    """
+
+    n_years = veg.shape[1]
+    n_windows = n_years - window + 1
+
+    # --------------------------------------------------------
+    # Original Topt sequence
+    # --------------------------------------------------------
+
+    observed_topt = np.array([
+        calculate_topt(
+            veg,
+            spei,
+            scales,
+            start=w,
+            window=window
+        )
+        for w in range(n_windows)
+    ])
+
+    observed_slope = theil_sen_slope(observed_topt)
+
+    # --------------------------------------------------------
+    # Trend-residual decomposition
+    # --------------------------------------------------------
+
+    veg_fit = np.full_like(veg, np.nan, dtype=float)
+    veg_res = np.full_like(veg, np.nan, dtype=float)
+
+    for m in range(veg.shape[0]):
+        veg_fit[m], veg_res[m] = fit_trend_and_residual(veg[m])
+
+    spei_fit = np.full_like(spei, np.nan, dtype=float)
+    spei_res = np.full_like(spei, np.nan, dtype=float)
+
+    for s in range(spei.shape[0]):
+        for m in range(spei.shape[1]):
+            spei_fit[s, m], spei_res[s, m] = \
+                fit_trend_and_residual(spei[s, m])
+
+    # --------------------------------------------------------
+    # Full-series MBB indices
+    # --------------------------------------------------------
+
+    boot_idx = mbb_indices(
+        n_years,
+        block_length=block_length,
+        n_boot=n_boot,
+        seed=seed
+    )
+
+    bootstrap_slopes = np.full(n_boot, np.nan)
+
+    # --------------------------------------------------------
+    # Bootstrap
+    # --------------------------------------------------------
+
+    for b in range(n_boot):
+
+        idx = boot_idx[b]
+
+        # Fitted values stay at their original temporal positions;
+        # only residuals are reassigned through moving blocks.
+        veg_boot = veg_fit + veg_res[:, idx]
+
+        spei_boot = spei_fit + spei_res[:, :, idx]
+
+        boot_topt = np.array([
+            calculate_topt(
+                veg_boot,
+                spei_boot,
+                scales,
+                start=w,
+                window=window
+            )
+            for w in range(n_windows)
+        ])
+
+        bootstrap_slopes[b] = theil_sen_slope(boot_topt)
+
+    valid = bootstrap_slopes[np.isfinite(bootstrap_slopes)]
+
+    return {
+        "observed_slope": observed_slope,
+        "bootstrap_median": np.median(valid),
+        "CI_lower": np.percentile(valid, 2.5),
+        "CI_upper": np.percentile(valid, 97.5),
+        "P_positive": np.mean(valid > 0),
+        "P_zero": np.mean(valid == 0),
+        "P_negative": np.mean(valid < 0),
+        "bootstrap_slopes": bootstrap_slopes,
+        "observed_Topt": observed_topt
+    }
