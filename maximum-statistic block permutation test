@@ -14,14 +14,22 @@ def block_permutations(
         for i in range(0, n_years, block_length)
     ]
 
+    identity = tuple(range(n_years))
+    seen = set()
     perms = []
 
     while len(perms) < n_perm:
         order = rng.permutation(len(blocks))
         idx = np.concatenate([blocks[i] for i in order])
 
-        if not np.array_equal(idx, np.arange(n_years)):
-            perms.append(idx)
+        key = tuple(idx.tolist())
+
+        # Exclude the original order and duplicate permutations
+        if key == identity or key in seen:
+            continue
+
+        seen.add(key)
+        perms.append(idx)
 
     return np.asarray(perms)
 
@@ -54,9 +62,7 @@ def maxstat_rmax_topt(
     scales = np.arange(1, 25)
     months = np.arange(4, 11)
 
-    # --------------------------------------------------------
     # Observed Rmax and Topt
-    # --------------------------------------------------------
     observed_rmax = -np.inf
     observed_topt = np.nan
     best_month = np.nan
@@ -77,9 +83,7 @@ def maxstat_rmax_topt(
     if not np.isfinite(observed_rmax):
         return np.nan, np.nan, np.nan, np.nan
 
-    # --------------------------------------------------------
     # Maximum-statistic block permutation
-    # --------------------------------------------------------
     permutations = block_permutations()
 
     null_maxima = []
