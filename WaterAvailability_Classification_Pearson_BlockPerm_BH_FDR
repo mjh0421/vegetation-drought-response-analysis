@@ -2,178 +2,145 @@ import numpy as np
 from scipy.stats import pearsonr
 
 
-def bh_fdr(p_values, alpha=0.05):
-    p_values = np.asarray(p_values, float)
+def bh_fdr(pvals, alpha=0.05):
+    pvals = np.asarray(pvals, float)
+    reject = np.zeros(pvals.shape, bool)
 
-    valid = np.isfinite(p_values)
-    reject = np.zeros(p_values.shape, dtype=bool)
-
-    p = p_values[valid]
-    if len(p) == 0:
+    valid = np.isfinite(pvals)
+    p = pvals[valid]
+    if p.size == 0:
         return reject
 
-    order = np.argsort(p)
-    p_sorted = p[order]
-    m = len(p_sorted)
-
-    passed = (
-        p_sorted
-        <= alpha * np.arange(1, m + 1) / m
-    )
+    ps = np.sort(p)
+    passed = ps <= alpha * np.arange(1, len(ps) + 1) / len(ps)
 
     if np.any(passed):
-        threshold = p_sorted[np.where(passed)[0].max()]
-        reject[valid] = p <= threshold
+        cutoff = ps[np.where(passed)[0][-1]]
+        reject[valid] = p <= cutoff
 
     return reject
 
 
-def make_block_permutations(
-    n_years=40,
-    block_size=2,
-    n_perm=999,
-    seed=20260714
-):
-    rng = np.random.default_rng(seed)
+def make_block_perms(n_years, block_size=2, n_perm=999, seed=20260714):
+    if n_years % block_size != 0:
+        raise ValueError("n_years must be divisible by block_size.")
 
-    blocks = np.arange(n_years).reshape(
-        -1, block_size
-    )
+    rng = np.random.default_rng(seed)
+    blocks = np.arange(n_years).reshape(-1, block_size)
 
     return np.stack([
-        blocks[
-            rng.permutation(len(blocks))
-        ].ravel()
+        blocks[rng.permutation(len(blocks))].ravel()
         for _ in range(n_perm)
     ])
 
 
-def correlation_test(x, y, permutations, min_n=10):
+def block_test(x, y, perms, min_n=10):
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
     valid = np.isfinite(x) & np.isfinite(y)
 
-    if (
-        valid.sum() < min_n
-        or np.std(x[valid]) == 0
-        or np.std(y[valid]) == 0
-    ):
+    if valid.sum() < min_n:
         return np.nan, np.nan, np.nan
 
-    x = x[valid]
-    y = y[valid]
+    xv, yv = x[valid], y[valid]
+    if np.std(xv) == 0 or np.std(yv) == 0:
+        return np.nan, np.nan, np.nan
 
-    r, p_pearson = pearsonr(x, y)
+    r, p_pearson = pearsonr(xv, yv)
 
-    # complete 40-year series
-    if len(x) == len(permutations[0]):
+    # Fast path for complete annual series
+    if np.all(valid):
         x0 = x - x.mean()
         y0 = y - y.mean()
 
-        sx = np.sqrt(np.sum(x0 ** 2))
-        sy = np.sqrt(np.sum(y0 ** 2))
-
-        r_perm = (
-            y0[permutations] / sy
+        rp = (
+            y0[perms] / np.sqrt(np.sum(y0 ** 2))
         ) @ (
-            x0 / sx
+            x0 / np.sqrt(np.sum(x0 ** 2))
         )
 
         p_block = (
-            1
-            + np.sum(
-                np.abs(r_perm) >= abs(r)
-            )
-        ) / (
-            len(permutations) + 1
-        )
+            1 + np.sum(np.abs(rp) >= abs(r))
+        ) / (len(perms) + 1)
 
-    else:
-        p_block = np.nan
+        return r, p_pearson, p_block
+
+    # Fallback for incomplete series
+    extreme, n = 0, 0
+
+    for idx in perms:
+        yp = y[idx]
+        v = np.isfinite(x) & np.isfinite(yp)
+
+        if v.sum() < min_n:
+            continue
+        if np.std(x[v]) == 0 or np.std(yp[v]) == 0:
+            continue
+
+        rp = pearsonr(x[v], yp[v])[0]
+        n += 1
+        extreme += abs(rp) >= abs(r)
+
+    p_block = (1 + extreme) / (n + 1) if n else np.nan
 
     return r, p_pearson, p_block
 
 
-def classify(r_values, significant):
-    n_positive = np.sum(
-        significant & (r_values > 0)
-    )
+def classify(rs, significant):
+    n_pos = np.sum(significant & (rs > 0))
+    n_neg = np.sum(significant & (rs < 0))
 
-    n_negative = np.sum(
-        significant & (r_values < 0)
-    )
-
-    if n_positive > n_negative:
-        water_class = 1      # water-deficit
-
-    elif n_negative > n_positive:
-        water_class = -1     # water-surplus
-
-    else:
-        water_class = 0      # unclassified
-
-    return water_class, n_positive, n_negative
+    if n_pos > n_neg:
+        return 1       # water-deficit
+    if n_neg > n_pos:
+        return -1      # water-surplus
+    return 0           # unclassified
 
 
-def water_availability_classification(
-    vegetation,
-    spei,
-    permutations
-):
+def classify_pixel(veg, spei_list, perms, p=0.05, fdr=0.05, min_n=10):
     """
-    vegetation: shape (7, 40)
-                April-October vegetation series
+    veg shape:
+        [7 months, years]
 
-    spei: shape (24, 7, 40)
-          SPEI scales 1-24 for April-October
+    spei_list:
+        24 arrays, each [7 months, years]
 
-    Returns
-    -------
-    Pearson,
-    Pearson_BH_FDR,
-    BlockPerm_BH_FDR
-
-    Each result:
-    water_class, N_positive, N_negative
+    7 months × 24 SPEI scales = 168 tests
     """
 
-    r_values = []
-    p_pearson = []
-    p_block = []
+    rs, p_pearson, p_block = [], [], []
 
-    # 7 months × 24 SPEI scales = 168 tests
-    for m in range(7):
-        for s in range(24):
+    for month in range(veg.shape[0]):
+        for spei in spei_list:
 
-            r, p1, p2 = correlation_test(
-                vegetation[m],
-                spei[s, m],
-                permutations
+            r, pp, pb = block_test(
+                veg[month],
+                spei[month],
+                perms,
+                min_n
             )
 
-            r_values.append(r)
-            p_pearson.append(p1)
-            p_block.append(p2)
+            rs.append(r)
+            p_pearson.append(pp)
+            p_block.append(pb)
 
-    r_values = np.asarray(r_values)
+    rs = np.asarray(rs)
     p_pearson = np.asarray(p_pearson)
     p_block = np.asarray(p_block)
 
-    # 1. Pearson p < 0.05
-    pearson = classify(
-        r_values,
-        np.isfinite(p_pearson)
-        & (p_pearson < 0.05)
-    )
+    return {
+        "pearson": classify(
+            rs,
+            np.isfinite(p_pearson) & (p_pearson < p)
+        ),
 
-    # 2. Pearson + BH-FDR
-    pearson_fdr = classify(
-        r_values,
-        bh_fdr(p_pearson, 0.05)
-    )
+        "pearson_fdr": classify(
+            rs,
+            bh_fdr(p_pearson, fdr)
+        ),
 
-    # 3. Block permutation + BH-FDR
-    block_fdr = classify(
-        r_values,
-        bh_fdr(p_block, 0.05)
-    )
-
-    return pearson, pearson_fdr, block_fdr
+        "block_fdr": classify(
+            rs,
+            bh_fdr(p_block, fdr)
+        )
+    }
