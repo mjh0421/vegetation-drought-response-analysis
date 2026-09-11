@@ -28,7 +28,7 @@ driver_files = [
 BLOCK_SIZE = 10       # 10 × 10 pixels ≈ 1° × 1°
 OUTER_FOLDS = 5
 INNER_FOLDS = 4
-N_BAYES_ITER = 50
+N_BAYES_ITER = 100
 RANDOM_STATE = 42
 
 
