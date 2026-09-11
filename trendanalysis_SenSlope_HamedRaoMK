@@ -18,7 +18,6 @@ START_YEAR = 1983
 LAST_START_YEAR = 2006
 
 ALPHA = 0.05
-MIN_VALID = 13
 
 os.makedirs(output_folder, exist_ok=True)
 
@@ -28,14 +27,23 @@ os.makedirs(output_folder, exist_ok=True)
 # ============================================================
 def read_tif(path):
     with rasterio.open(path) as src:
-        return src.read(1, masked=True).filled(np.nan).astype(np.float32)
+        return (
+            src.read(1, masked=True)
+            .filled(np.nan)
+            .astype(np.float32)
+        )
 
 
 # ============================================================
 # Pixel-wise Theil-Sen slope + Hamed-Rao modified MK test
+#
+# IMPORTANT:
+# Trend analysis is performed only for pixels with a complete
+# sequence of moving-window estimates. Missing windows are not
+# removed before trend calculation.
 # ============================================================
 def trend_analysis(data_stack):
-    _, nrows, ncols = data_stack.shape
+    n_windows, nrows, ncols = data_stack.shape
 
     slope_array = np.full(
         (nrows, ncols),
@@ -52,19 +60,29 @@ def trend_analysis(data_stack):
     for i in tqdm(range(nrows), desc="Trend analysis"):
         for j in range(ncols):
 
+            # Retain the original chronological sequence
             y = data_stack[:, i, j]
-            y = y[np.isfinite(y)]
 
-            if y.size < MIN_VALID:
+            # Require all moving-window estimates to be valid.
+            # For the 17-year analysis this corresponds to 24/24
+            # windows; for the 21-year analysis it corresponds
+            # to 20/20 windows.
+            if not np.all(np.isfinite(y)):
                 continue
 
-            result = mk.hamed_rao_modification_test(
-                y,
-                alpha=ALPHA
-            )
+            try:
+                result = mk.hamed_rao_modification_test(
+                    y,
+                    alpha=ALPHA
+                )
 
-            slope_array[i, j] = result.slope
-            pvalue_array[i, j] = result.p
+                slope_array[i, j] = result.slope
+                pvalue_array[i, j] = result.p
+
+            except Exception:
+                # Leave slope and p value as NaN if the
+                # Hamed-Rao calculation cannot be completed.
+                continue
 
     return slope_array, pvalue_array
 
@@ -99,7 +117,7 @@ def save_tif(path, data, profile):
 # ============================================================
 if __name__ == "__main__":
 
-    # Generate moving-window raster list
+    # Generate moving-window raster list in chronological order
     tif_list = [
         os.path.join(
             input_folder,
@@ -111,6 +129,12 @@ if __name__ == "__main__":
             LAST_START_YEAR + 1
         )
     ]
+
+    # Corresponding moving-window start years
+    window_years = np.arange(
+        START_YEAR,
+        LAST_START_YEAR + 1
+    )
 
     # Check input files
     missing_files = [
@@ -124,6 +148,16 @@ if __name__ == "__main__":
         )
 
     print(f"Number of moving windows: {len(tif_list)}")
+    print(
+        f"Window sequence: "
+        f"{START_YEAR}-{START_YEAR + WINDOW_LENGTH - 1} "
+        f"to "
+        f"{LAST_START_YEAR}-{LAST_START_YEAR + WINDOW_LENGTH - 1}"
+    )
+    print(
+        f"Complete-window criterion: "
+        f"{len(tif_list)}/{len(tif_list)} valid windows required."
+    )
 
     # Read raster metadata
     with rasterio.open(tif_list[0]) as src:
@@ -142,6 +176,19 @@ if __name__ == "__main__":
         tqdm(tif_list, desc="Reading rasters")
     ):
         data_stack[i] = read_tif(path)
+
+    # --------------------------------------------------------
+    # Diagnostic: complete-window mask
+    # --------------------------------------------------------
+    complete_mask = np.all(
+        np.isfinite(data_stack),
+        axis=0
+    )
+
+    print(
+        "Pixels with complete moving-window sequences:",
+        int(np.sum(complete_mask))
+    )
 
     # Trend analysis
     sen_slope, modified_mk_p = trend_analysis(
