@@ -1,0 +1,145 @@
+import numpy as np
+from numba import njit
+
+
+@njit
+def pearson_pairwise(x, y, min_n=10):
+    """
+    Pairwise-valid Pearson correlation.
+    """
+    n = 0
+    sx = 0.0
+    sy = 0.0
+
+    for t in range(len(x)):
+        if not np.isnan(x[t]) and not np.isnan(y[t]):
+            sx += x[t]
+            sy += y[t]
+            n += 1
+
+    if n < min_n:
+        return np.nan
+
+    mx = sx / n
+    my = sy / n
+
+    num = 0.0
+    dx2 = 0.0
+    dy2 = 0.0
+
+    for t in range(len(x)):
+        if not np.isnan(x[t]) and not np.isnan(y[t]):
+            dx = x[t] - mx
+            dy = y[t] - my
+
+            num += dx * dy
+            dx2 += dx * dx
+            dy2 += dy * dy
+
+    if dx2 <= 0 or dy2 <= 0:
+        return np.nan
+
+    return num / np.sqrt(dx2 * dy2)
+
+
+@njit
+def calculate_joint_and_fixed_month_topt(
+    vegetation,
+    spei_by_scale,
+    months,
+    min_n=10
+):
+    """
+    Calculate joint Rmax/Topt/Mopt and fixed-month Topt.
+
+    Parameters
+    ----------
+    vegetation : array
+        Shape [7 months, n_years].
+
+    spei_by_scale : list
+        24 arrays, each with shape [7 months, n_years],
+        corresponding to SPEI-1 ... SPEI-24.
+
+    months : array
+        Calendar months, e.g. [4, 5, 6, 7, 8, 9, 10].
+
+    Returns
+    -------
+    joint_rmax :
+        Maximum positive vegetation-SPEI correlation across
+        7 months × 24 SPEI timescales.
+
+    joint_topt :
+        SPEI timescale associated with joint_rmax.
+
+    mopt :
+        Calendar month associated with joint_rmax.
+
+    fixed_topt :
+        Month-specific Topt values. For each calendar month,
+        Topt is selected only across the 24 SPEI timescales.
+    """
+
+    n_months = vegetation.shape[0]
+    n_scales = len(spei_by_scale)
+
+    joint_rmax = -1e9
+    joint_topt = -1
+    mopt = -1
+
+    fixed_topt = np.full(
+        n_months,
+        np.nan,
+        dtype=np.float32
+    )
+
+    # --------------------------------------------------------
+    # Search each calendar month separately
+    # --------------------------------------------------------
+    for m in range(n_months):
+
+        month_best_r = -1e9
+        month_best_scale = -1
+
+        for s in range(n_scales):
+
+            r = pearson_pairwise(
+                vegetation[m],
+                spei_by_scale[s][m],
+                min_n
+            )
+
+            if np.isnan(r) or r <= 0:
+                continue
+
+            # Fixed-month Topt:
+            # maximum positive correlation across 24 scales
+            if r > month_best_r:
+                month_best_r = r
+                month_best_scale = s + 1
+
+            # Joint Rmax/Topt/Mopt:
+            # maximum across 7 months × 24 scales
+            if r > joint_rmax:
+                joint_rmax = r
+                joint_topt = s + 1
+                mopt = months[m]
+
+        if month_best_scale > 0:
+            fixed_topt[m] = month_best_scale
+
+    if joint_topt < 0:
+        return (
+            np.nan,
+            np.nan,
+            np.nan,
+            fixed_topt
+        )
+
+    return (
+        joint_rmax,
+        joint_topt,
+        mopt,
+        fixed_topt
+    )
