@@ -1,0 +1,257 @@
+import os
+import numpy as np
+import pandas as pd
+import rasterio
+import pymannkendall as mk
+from scipy.stats import theilslopes
+
+
+"""
+Fixed-month Topt and selected-month analysis.
+
+This script:
+1. Calculates fixed-month Topt trends for April–October.
+2. Requires valid Topt estimates in all 24 17-year moving windows.
+3. Uses Theil–Sen slope and the Hamed–Rao modified Mann–Kendall test.
+4. Generates the summary used for Table S4.
+5. Tracks the calendar month associated with the joint maximum correlation.
+6. Quantifies selected-month proportions and switching frequency.
+
+Input structure
+---------------
+data/
+├── Fixed_month/
+│   ├── M04/Topt_M04_1983_1999.tif
+│   ├── M04/Topt_M04_1984_2000.tif
+│   ├── ...
+│   └── M10/Topt_M10_2006_2022.tif
+└── Joint/
+    ├── Mopt_1983_1999.tif
+    ├── ...
+    └── Mopt_2006_2022.tif
+
+Main outputs
+------------
+- Fixed_month_Topt_trend_summary.csv
+- Mopt_month_proportions_by_window.csv
+- Mopt_switch_summary.csv
+"""
+
+
+# =====================================================
+# 1. Settings
+# =====================================================
+BASE_DIR = "./data"
+FIXED_DIR = os.path.join(BASE_DIR, "Fixed_month")
+JOINT_DIR = os.path.join(BASE_DIR, "Joint")
+OUT_DIR = "./outputs"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+YEARS = np.arange(1983, 2023)
+WINDOW = 17
+STARTS = YEARS[:len(YEARS) - WINDOW + 1]
+ENDS = STARTS + WINDOW - 1
+MONTHS = np.arange(4, 11)
+
+N_WINDOWS = len(STARTS)   # 24
+
+
+# =====================================================
+# 2. IO
+# =====================================================
+def read_raster(path):
+    with rasterio.open(path) as src:
+        arr = src.read(1).astype(np.float32)
+        nodata = src.nodata
+
+    if nodata is not None:
+        arr[arr == nodata] = np.nan
+
+    return arr
+
+
+# =====================================================
+# 3. Trend test
+# =====================================================
+def trend_test(y):
+    """Theil-Sen slope + Hamed-Rao modified MK test."""
+
+    if len(y) != N_WINDOWS or not np.all(np.isfinite(y)):
+        return np.nan, np.nan
+
+    if np.unique(y).size < 2:
+        return 0.0, 1.0
+
+    slope = theilslopes(y, STARTS)[0]
+    p = mk.hamed_rao_modification_test(y).p
+
+    return slope, p
+
+
+# =====================================================
+# 4. Fixed-month Topt analysis
+# =====================================================
+summary = []
+
+for month in MONTHS:
+
+    stack = []
+
+    for start, end in zip(STARTS, ENDS):
+
+        path = os.path.join(
+            FIXED_DIR,
+            f"M{month:02d}",
+            f"Topt_M{month:02d}_{start}_{end}.tif"
+        )
+
+        stack.append(read_raster(path))
+
+    stack = np.stack(stack)
+
+    # Pixels valid in all 24 moving windows
+    complete = np.all(np.isfinite(stack), axis=0)
+    n_complete = int(complete.sum())
+
+    # National mean Topt for each window,
+    # calculated from the same complete pixel set
+    mean_ts = np.array([
+        np.mean(stack[t][complete])
+        for t in range(N_WINDOWS)
+    ])
+
+    national_slope, national_p = trend_test(mean_ts)
+
+    # Pixel-level trends
+    slope_list = []
+    p_list = []
+
+    for y in stack[:, complete].T:
+        slope, p = trend_test(y)
+        slope_list.append(slope)
+        p_list.append(p)
+
+    slopes = np.asarray(slope_list)
+    pvals = np.asarray(p_list)
+
+    positive = slopes > 0
+    negative = slopes < 0
+    zero = slopes == 0
+
+    sig_positive = positive & (pvals < 0.05)
+    sig_negative = negative & (pvals < 0.05)
+
+    summary.append({
+        "Month": month,
+        "Complete_24window_pixels": n_complete,
+        "National_Sen_slope": national_slope,
+        "National_HR_p": national_p,
+        "Positive_pct": 100 * positive.mean(),
+        "Negative_pct": 100 * negative.mean(),
+        "Zero_pct": 100 * zero.mean(),
+        "Sig_positive_pct": 100 * sig_positive.mean(),
+        "Sig_negative_pct": 100 * sig_negative.mean()
+    })
+
+
+pd.DataFrame(summary).to_csv(
+    os.path.join(
+        OUT_DIR,
+        "Fixed_month_Topt_trend_summary.csv"
+    ),
+    index=False
+)
+
+
+# =====================================================
+# 5. Selected-month tracking
+# =====================================================
+mopt_stack = []
+
+for start, end in zip(STARTS, ENDS):
+
+    path = os.path.join(
+        JOINT_DIR,
+        f"Mopt_{start}_{end}.tif"
+    )
+
+    mopt_stack.append(read_raster(path))
+
+mopt_stack = np.stack(mopt_stack)
+
+
+# =====================================================
+# 6. Selected-month proportions by window
+# =====================================================
+rows = []
+
+for t, (start, end) in enumerate(zip(STARTS, ENDS)):
+
+    arr = mopt_stack[t]
+    valid = np.isfinite(arr)
+    n = int(valid.sum())
+
+    row = {
+        "Window_start": start,
+        "Window_end": end,
+        "Valid_pixels": n
+    }
+
+    for month in MONTHS:
+        row[f"M{month:02d}_pct"] = (
+            100 * np.sum(arr[valid] == month) / n
+            if n > 0 else np.nan
+        )
+
+    rows.append(row)
+
+
+pd.DataFrame(rows).to_csv(
+    os.path.join(
+        OUT_DIR,
+        "Mopt_month_proportions_by_window.csv"
+    ),
+    index=False
+)
+
+
+# =====================================================
+# 7. Selected-month switching
+# =====================================================
+complete = np.all(np.isfinite(mopt_stack), axis=0)
+
+series = mopt_stack[:, complete].T
+
+n_switches = np.sum(
+    series[:, 1:] != series[:, :-1],
+    axis=1
+)
+
+switch_frequency = n_switches / (N_WINDOWS - 1)
+
+switch_summary = pd.DataFrame({
+    "Statistic": [
+        "Complete_24window_pixels",
+        "Mean_number_of_switches",
+        "Median_number_of_switches",
+        "Mean_switch_frequency",
+        "Median_switch_frequency"
+    ],
+    "Value": [
+        int(complete.sum()),
+        np.mean(n_switches),
+        np.median(n_switches),
+        np.mean(switch_frequency),
+        np.median(switch_frequency)
+    ]
+})
+
+switch_summary.to_csv(
+    os.path.join(
+        OUT_DIR,
+        "Mopt_switch_summary.csv"
+    ),
+    index=False
+)
+
+print("Analysis finished.")
