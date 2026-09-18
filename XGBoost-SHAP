@@ -1,3 +1,23 @@
+# =====================================================
+# Input mapping used in the manuscript
+# =====================================================
+# Target variables:
+# Rmax trend -> xxx.tif
+# Topt trend -> xxx.tif
+#
+# Predictors:
+# Rad       -> xxx.tif
+# Rad_Trend -> xxx.tif
+# CO2       -> xxx.tif
+# VPD       -> xxx.tif
+# VPD_Trend -> xxx.tif
+# AI        -> xxx.tif
+# Prec      -> xxx.tif
+# ...
+#
+# Detailed variable definitions and preprocessing procedures
+# are provided in the Methods and Supplementary Information.
+
 import numpy as np
 import rasterio
 import shap
